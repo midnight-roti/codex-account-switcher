@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -47,10 +46,9 @@ struct ManagedAccount {
 pub fn load_accounts() -> Result<Vec<AccountRecord>> {
     let mut managed = load_managed_accounts()?;
     let codex = load_codex_account()?;
-    let opencode = load_opencode_account()?;
 
     let mut changed = false;
-    for external in [codex.clone(), opencode.clone()].into_iter().flatten() {
+    for external in [codex.clone()].into_iter().flatten() {
         if !external.access_token.trim().is_empty() && !external.account_id.trim().is_empty() {
             upsert_managed_account(&external)?;
             changed = true;
@@ -62,10 +60,6 @@ pub fn load_accounts() -> Result<Vec<AccountRecord>> {
 
     for account in &mut managed {
         account.codex_active = codex
-            .as_ref()
-            .map(|current| same_identity(account, current))
-            .unwrap_or(false);
-        account.opencode_active = opencode
             .as_ref()
             .map(|current| same_identity(account, current))
             .unwrap_or(false);
@@ -136,9 +130,6 @@ pub fn delete_account(account: &AccountRecord) -> Result<()> {
     if account.codex_active {
         delete_codex_auth_account()?;
     }
-    if account.opencode_active {
-        delete_opencode_auth_account()?;
-    }
     Ok(())
 }
 
@@ -170,44 +161,6 @@ pub fn apply_account_to_codex(account: &AccountRecord) -> Result<PathBuf> {
         "last_refresh".to_string(),
         Value::String(Utc::now().to_rfc3339()),
     );
-    write_json_map(&path, &root)?;
-    Ok(path)
-}
-
-pub fn apply_account_to_opencode(account: &AccountRecord) -> Result<PathBuf> {
-    let paths = opencode_apply_paths();
-    if paths.is_empty() {
-        bail!("OpenCode auth path is unknown");
-    }
-
-    let path = paths[0].clone();
-    let mut root = read_json_map_or_default(&path)?;
-    let openai = object_mut(&mut root, "openai");
-    openai.insert(
-        "access".to_string(),
-        Value::String(account.access_token.clone()),
-    );
-    if !account.refresh_token.trim().is_empty() {
-        openai.insert(
-            "refresh".to_string(),
-            Value::String(account.refresh_token.clone()),
-        );
-    }
-    if !account.account_id.trim().is_empty() {
-        openai.insert(
-            "accountId".to_string(),
-            Value::String(account.account_id.clone()),
-        );
-    }
-    if !account.email.trim().is_empty() {
-        openai.insert("email".to_string(), Value::String(account.email.clone()));
-    }
-    if let Some(expiry) = account.expires_at {
-        openai.insert(
-            "expires".to_string(),
-            Value::Number(expiry.timestamp_millis().into()),
-        );
-    }
     write_json_map(&path, &root)?;
     Ok(path)
 }
@@ -322,7 +275,6 @@ fn managed_to_record(item: ManagedAccount) -> AccountRecord {
         client_id: first_non_empty(&[item.client_id.as_str(), claims.client_id.as_str()]),
         managed: true,
         codex_active: false,
-        opencode_active: false,
         quota: crate::model::QuotaState::Idle,
     }
 }
@@ -421,73 +373,8 @@ fn load_codex_account() -> Result<Option<AccountRecord>> {
         client_id: claims.client_id,
         managed: false,
         codex_active: true,
-        opencode_active: false,
         quota: crate::model::QuotaState::Idle,
     }))
-}
-
-fn load_opencode_account() -> Result<Option<AccountRecord>> {
-    for path in opencode_auth_paths() {
-        if !path.exists() {
-            continue;
-        }
-        let root = read_json_map(&path)?;
-        let Some(openai) = root.get("openai").and_then(Value::as_object) else {
-            continue;
-        };
-        let access_token = openai
-            .get("access")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if access_token.is_empty() {
-            continue;
-        }
-        let claims = parse_access_token(&access_token);
-        return Ok(Some(AccountRecord {
-            label: first_non_empty(&[
-                openai
-                    .get("email")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                claims.email.as_str(),
-            ]),
-            email: first_non_empty(&[
-                openai
-                    .get("email")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                claims.email.as_str(),
-            ]),
-            account_id: canonical_account_id(&[
-                openai
-                    .get("accountId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                claims.account_id.as_str(),
-            ]),
-            access_token,
-            refresh_token: openai
-                .get("refresh")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-            expires_at: openai
-                .get("expires")
-                .and_then(Value::as_i64)
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .or(claims.expires_at),
-            client_id: claims.client_id,
-            managed: false,
-            codex_active: false,
-            opencode_active: true,
-            quota: crate::model::QuotaState::Idle,
-        }));
-    }
-
-    Ok(None)
 }
 
 fn delete_codex_auth_account() -> Result<()> {
@@ -501,20 +388,6 @@ fn delete_codex_auth_account() -> Result<()> {
     tokens.remove("refresh_token");
     tokens.remove("account_id");
     write_json_map(&path, &root)
-}
-
-fn delete_opencode_auth_account() -> Result<()> {
-    for path in opencode_existing_paths() {
-        let mut root = read_json_map(&path)?;
-        let openai = object_mut(&mut root, "openai");
-        openai.remove("access");
-        openai.remove("refresh");
-        openai.remove("accountId");
-        openai.remove("email");
-        openai.remove("expires");
-        write_json_map(&path, &root)?;
-    }
-    Ok(())
 }
 
 fn same_identity(left: &AccountRecord, right: &AccountRecord) -> bool {
@@ -595,64 +468,6 @@ fn codex_auth_path() -> PathBuf {
         }
     }
     home_dir().join(".codex").join("auth.json")
-}
-
-fn opencode_auth_paths() -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let mut paths = Vec::new();
-
-    if let Ok(path) = std::env::var("OPENCODE_AUTH_PATH") {
-        if !path.trim().is_empty() {
-            let path = PathBuf::from(path);
-            if seen.insert(path.clone()) {
-                paths.push(path);
-            }
-        }
-    }
-
-    let home = home_dir();
-    let candidates = [
-        std::env::var("OPENCODE_DATA_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from),
-        Some(home.join(".local").join("share").join("opencode")),
-        Some(home.join(".config").join("opencode")),
-        Some(
-            home.join("Library")
-                .join("Application Support")
-                .join("opencode"),
-        ),
-        Some(home.join(".opencode")),
-    ];
-
-    for dir in candidates.into_iter().flatten() {
-        let path = dir.join("auth.json");
-        if seen.insert(path.clone()) {
-            paths.push(path);
-        }
-    }
-
-    paths
-}
-
-fn opencode_existing_paths() -> Vec<PathBuf> {
-    opencode_auth_paths()
-        .into_iter()
-        .filter(|path| path.exists())
-        .collect()
-}
-
-fn opencode_apply_paths() -> Vec<PathBuf> {
-    let existing = opencode_existing_paths();
-    if !existing.is_empty() {
-        return existing;
-    }
-    let all = opencode_auth_paths();
-    if !all.is_empty() {
-        return vec![all[0].clone()];
-    }
-    Vec::new()
 }
 
 fn read_json_map(path: &Path) -> Result<Map<String, Value>> {

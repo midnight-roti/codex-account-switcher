@@ -1,6 +1,6 @@
 # Codex Account Switcher
 
-A Rust terminal UI for managing multiple Codex accounts, checking quota quickly, and switching the active account used by Codex or OpenCode.
+A Rust terminal UI for managing multiple Codex accounts, checking quota quickly, and switching the active account used by Codex.
 
 ## Main Features
 
@@ -9,7 +9,7 @@ A Rust terminal UI for managing multiple Codex accounts, checking quota quickly,
 - Sort accounts by remaining quota and hide exhausted accounts by default
 - Add and delete accounts from the app
 - Refresh the selected account or all accounts from the keyboard
-- Apply the selected account to Codex or OpenCode
+- Apply the selected account to Codex
 - Search accounts and filter by plan type
 
 ## Run

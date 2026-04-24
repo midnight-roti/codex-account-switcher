@@ -11,7 +11,6 @@ pub struct AccountRecord {
     pub client_id: String,
     pub managed: bool,
     pub codex_active: bool,
-    pub opencode_active: bool,
     pub quota: QuotaState,
 }
 
