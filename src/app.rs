@@ -1,5 +1,6 @@
 use std::cmp::min;
 use std::io::{self, Stdout};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -128,23 +129,34 @@ enum ListItem {
 enum WorkerEvent {
     QuotaLoaded(AccountRecord),
     QuotaFailed { key: String, error: String },
-    AddFinished(Result<AccountRecord, String>),
+    AuthFinished {
+        result: Result<AccountRecord, String>,
+        mode: AuthFlowMode,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum AuthFlowMode {
+    Add,
+    Relogin,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum ActionMenuItem {
     ApplyCodex,
-    ApplyOpenCode,
+    ApplyRestartCodex,
+    Relogin,
     Refresh,
     Delete,
     Cancel,
 }
 
 impl ActionMenuItem {
-    fn all() -> [Self; 5] {
+    fn all() -> [Self; 6] {
         [
             Self::ApplyCodex,
-            Self::ApplyOpenCode,
+            Self::ApplyRestartCodex,
+            Self::Relogin,
             Self::Refresh,
             Self::Delete,
             Self::Cancel,
@@ -154,7 +166,8 @@ impl ActionMenuItem {
     fn label(self) -> &'static str {
         match self {
             Self::ApplyCodex => "Apply to Codex",
-            Self::ApplyOpenCode => "Apply to OpenCode",
+            Self::ApplyRestartCodex => "Apply and restart Codex",
+            Self::Relogin => "Re-login account",
             Self::Refresh => "Refresh Quota",
             Self::Delete => "Delete Account",
             Self::Cancel => "Cancel",
@@ -318,7 +331,7 @@ impl App {
             KeyCode::Char('R') => self.refresh_all(tx),
             KeyCode::Enter => self.open_action_menu_or_toggle_exhausted(),
             KeyCode::Char('s') => self.apply_selected_to_codex()?,
-            KeyCode::Char('o') => self.apply_selected_to_opencode()?,
+            KeyCode::Char('l') => self.relogin_selected(tx),
             KeyCode::Char('d') => self.delete_selected(tx)?,
             KeyCode::Char('a') => self.add_account(tx),
             _ => {}
@@ -342,14 +355,19 @@ impl App {
                 }
                 self.status = error;
             }
-            WorkerEvent::AddFinished(result) => {
+            WorkerEvent::AuthFinished { result, mode } => {
                 self.add_in_progress = false;
                 match result {
                     Ok(account) => {
                         storage::upsert_managed_account(&account)?;
                         self.reload_accounts(tx);
                         self.select_account_key(&account.key());
-                        self.status = format!("added {}", account.display_name());
+                        self.status = match mode {
+                            AuthFlowMode::Add => format!("added {}", account.display_name()),
+                            AuthFlowMode::Relogin => {
+                                format!("re-logged {}", account.display_name())
+                            }
+                        };
                     }
                     Err(error) => self.status = error,
                 }
@@ -522,19 +540,19 @@ impl App {
             ),
             Span::raw(" codex  "),
             Span::styled(
-                "o",
-                Style::default()
-                    .fg(Color::Rgb(80, 220, 255))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" opencode  "),
-            Span::styled(
                 "a",
                 Style::default()
                     .fg(Color::Rgb(80, 220, 255))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" add  "),
+            Span::styled(
+                "l",
+                Style::default()
+                    .fg(Color::Rgb(80, 220, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" re-login  "),
             Span::styled(
                 "d",
                 Style::default()
@@ -654,7 +672,7 @@ impl App {
                 ),
             ]),
             Line::from(vec![
-                label_span("Sources"),
+                label_span("Active"),
                 Span::raw(": "),
                 Span::styled(active_badges(account), Style::default().fg(theme_green())),
                 Span::raw("  "),
@@ -732,7 +750,8 @@ impl App {
         self.close_action_menu();
         match action {
             ActionMenuItem::ApplyCodex => self.apply_selected_to_codex()?,
-            ActionMenuItem::ApplyOpenCode => self.apply_selected_to_opencode()?,
+            ActionMenuItem::ApplyRestartCodex => self.apply_selected_to_codex_and_restart()?,
+            ActionMenuItem::Relogin => self.relogin_selected(tx),
             ActionMenuItem::Refresh => self.refresh_selected(tx),
             ActionMenuItem::Delete => self.delete_selected(tx)?,
             ActionMenuItem::Cancel => {}
@@ -827,7 +846,25 @@ impl App {
         self.status = "opening browser for login...".to_string();
         thread::spawn(move || {
             let result = oauth::login_account().map_err(|error| error.to_string());
-            let _ = tx.send(WorkerEvent::AddFinished(result));
+            let _ = tx.send(WorkerEvent::AuthFinished {
+                result,
+                mode: AuthFlowMode::Add,
+            });
+        });
+    }
+
+    fn relogin_selected(&mut self, tx: Sender<WorkerEvent>) {
+        if self.add_in_progress || self.selected_account_index().is_none() {
+            return;
+        }
+        self.add_in_progress = true;
+        self.status = "opening browser to re-login account...".to_string();
+        thread::spawn(move || {
+            let result = oauth::login_account().map_err(|error| error.to_string());
+            let _ = tx.send(WorkerEvent::AuthFinished {
+                result,
+                mode: AuthFlowMode::Relogin,
+            });
         });
     }
 
@@ -842,6 +879,14 @@ impl App {
     }
 
     fn apply_selected_to_codex(&mut self) -> Result<()> {
+        self.apply_selected_to_codex_internal(false)
+    }
+
+    fn apply_selected_to_codex_and_restart(&mut self) -> Result<()> {
+        self.apply_selected_to_codex_internal(true)
+    }
+
+    fn apply_selected_to_codex_internal(&mut self, restart: bool) -> Result<()> {
         if let Some(index) = self.selected_account_index() {
             let account = self.accounts[index].clone();
             let path = storage::apply_account_to_codex(&account)?;
@@ -851,22 +896,12 @@ impl App {
             if let Some(account) = self.accounts.get_mut(index) {
                 account.codex_active = true;
             }
-            self.status = format!("applied to Codex: {}", path.display());
-        }
-        Ok(())
-    }
-
-    fn apply_selected_to_opencode(&mut self) -> Result<()> {
-        if let Some(index) = self.selected_account_index() {
-            let account = self.accounts[index].clone();
-            let path = storage::apply_account_to_opencode(&account)?;
-            for account in &mut self.accounts {
-                account.opencode_active = false;
+            if restart {
+                restart_codex_app()?;
+                self.status = format!("applied to Codex and restarted app: {}", path.display());
+            } else {
+                self.status = format!("applied to Codex: {}", path.display());
             }
-            if let Some(account) = self.accounts.get_mut(index) {
-                account.opencode_active = true;
-            }
-            self.status = format!("applied to OpenCode: {}", path.display());
         }
         Ok(())
     }
@@ -1039,15 +1074,54 @@ impl App {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn restart_codex_app() -> Result<()> {
+    let _ = Command::new("taskkill")
+        .args(["/IM", "Codex.exe", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    thread::sleep(Duration::from_millis(900));
+    Command::new("explorer.exe")
+        .arg("shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to relaunch Codex")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn restart_codex_app() -> Result<()> {
+    let _ = Command::new("osascript")
+        .args(["-e", "tell application \"Codex\" to quit"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    thread::sleep(Duration::from_millis(900));
+    Command::new("open")
+        .args(["-a", "Codex"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to relaunch Codex")?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn restart_codex_app() -> Result<()> {
+    anyhow::bail!("Codex restart is only supported on Windows and macOS right now")
+}
+
 fn active_badges(account: &AccountRecord) -> String {
-    let mut badges = Vec::new();
     if account.codex_active {
-        badges.push("✓C");
+        return format!("{:^8}", "●");
     }
-    if account.opencode_active {
-        badges.push("✓O");
-    }
-    badges.join(" ")
+    " ".repeat(8)
 }
 
 fn account_cell(account: &AccountRecord) -> Text<'static> {

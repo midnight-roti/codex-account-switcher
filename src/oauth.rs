@@ -87,7 +87,6 @@ pub fn login_account() -> Result<AccountRecord> {
         },
         managed: true,
         codex_active: false,
-        opencode_active: false,
         quota: crate::model::QuotaState::Idle,
     })
 }
