@@ -12,10 +12,32 @@ A Rust terminal UI for managing multiple Codex accounts, checking quota quickly,
 - Apply the selected account to Codex
 - Search accounts and filter by plan type
 
+## Install
+
+Local clone:
+
+```powershell
+cargo install --path .
+```
+
+Direct from GitHub:
+
+```powershell
+cargo install --git https://github.com/midnight-roti/codex-account-switcher --bin cas
+```
+
+Do not run `cargo install cas` unless this crate is published under that name on crates.io. That command installs a different crate from the registry.
+
 ## Run
 
 ```powershell
 cargo run
+```
+
+Installed binary:
+
+```powershell
+cas
 ```
 
 ## Build
