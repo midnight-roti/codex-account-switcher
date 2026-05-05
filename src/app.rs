@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::env;
 use std::io::{self, Stdout};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -26,43 +27,96 @@ use crate::storage;
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 fn theme_pink() -> Color {
+    if use_ansi_palette() {
+        return Color::LightMagenta;
+    }
     Color::Rgb(255, 102, 170)
 }
 
 fn theme_cyan() -> Color {
+    if use_ansi_palette() {
+        return Color::LightCyan;
+    }
     Color::Rgb(68, 196, 255)
 }
 
 fn theme_green() -> Color {
+    if use_ansi_palette() {
+        return Color::LightGreen;
+    }
     Color::Rgb(92, 212, 120)
 }
 
 fn theme_violet() -> Color {
+    if use_ansi_palette() {
+        return Color::Magenta;
+    }
     Color::Rgb(132, 107, 255)
 }
 
 fn theme_text() -> Color {
+    if use_ansi_palette() {
+        return Color::White;
+    }
     Color::Rgb(230, 225, 218)
 }
 
 fn theme_muted() -> Color {
+    if use_ansi_palette() {
+        return Color::DarkGray;
+    }
     Color::Rgb(117, 124, 134)
 }
 
 fn theme_border() -> Color {
+    if use_ansi_palette() {
+        return Color::DarkGray;
+    }
     Color::Rgb(56, 77, 103)
 }
 
 fn theme_selection_bg() -> Color {
+    if use_ansi_palette() {
+        return Color::Blue;
+    }
     Color::Rgb(38, 78, 123)
 }
 
 fn theme_warning() -> Color {
+    if use_ansi_palette() {
+        return Color::Yellow;
+    }
     Color::Rgb(255, 196, 82)
 }
 
 fn theme_danger() -> Color {
+    if use_ansi_palette() {
+        return Color::LightRed;
+    }
     Color::Rgb(255, 98, 98)
+}
+
+fn use_ansi_palette() -> bool {
+    if let Ok(force) = env::var("CAS_FORCE_TRUECOLOR") {
+        let normalized = force.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "1" | "true" | "yes" | "on") {
+            return false;
+        }
+    }
+
+    let colorterm = env::var("COLORTERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if colorterm.contains("truecolor") || colorterm.contains("24bit") {
+        return false;
+    }
+
+    let term = env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    if term.contains("direct") || term.contains("truecolor") || term.contains("24bit") {
+        return false;
+    }
+
+    cfg!(target_os = "macos")
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
@@ -135,10 +189,19 @@ enum WorkerEvent {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum AuthFlowMode {
     Add,
     Relogin,
+}
+
+impl AuthFlowMode {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Add => "login",
+            Self::Relogin => "re-login",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,6 +212,11 @@ enum ActionMenuItem {
     Refresh,
     Delete,
     Cancel,
+}
+
+struct AuthLinkPopup {
+    mode: AuthFlowMode,
+    url: String,
 }
 
 impl ActionMenuItem {
@@ -233,6 +301,7 @@ struct App {
     plan_filter: PlanFilter,
     action_menu_open: bool,
     action_menu_cursor: usize,
+    auth_popup: Option<AuthLinkPopup>,
 }
 
 impl App {
@@ -253,6 +322,7 @@ impl App {
             plan_filter: PlanFilter::All,
             action_menu_open: false,
             action_menu_cursor: 0,
+            auth_popup: None,
         };
         app.ensure_selection_valid();
         app.fetch_missing(tx);
@@ -260,6 +330,14 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode, tx: Sender<WorkerEvent>) -> Result<()> {
+        if self.auth_popup.is_some() {
+            match code {
+                KeyCode::Esc | KeyCode::Enter => self.auth_popup = None,
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if self.action_menu_open {
             match code {
                 KeyCode::Esc => self.close_action_menu(),
@@ -357,6 +435,7 @@ impl App {
             }
             WorkerEvent::AuthFinished { result, mode } => {
                 self.add_in_progress = false;
+                self.auth_popup = None;
                 match result {
                     Ok(account) => {
                         storage::upsert_managed_account(&account)?;
@@ -404,7 +483,7 @@ impl App {
                 Span::raw("  "),
                 Span::styled(
                     if self.add_in_progress {
-                        "adding account..."
+                        "login in progress..."
                     } else {
                         ""
                     },
@@ -487,6 +566,9 @@ impl App {
         self.draw_details(frame, body_areas[1]);
         if self.action_menu_open {
             self.draw_action_menu(frame);
+        }
+        if self.auth_popup.is_some() {
+            self.draw_auth_popup(frame);
         }
 
         let footer = Paragraph::new(vec![Line::from(vec![
@@ -798,6 +880,54 @@ impl App {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     }
 
+    fn draw_auth_popup(&self, frame: &mut ratatui::Frame<'_>) {
+        let Some(popup) = &self.auth_popup else {
+            return;
+        };
+
+        let area = centered_rect(72, 10, frame.area());
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Login Link")
+            .border_style(Style::default().fg(theme_border()))
+            .title_style(
+                Style::default()
+                    .fg(theme_pink())
+                    .add_modifier(Modifier::BOLD),
+            );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("Open this {} URL in any browser.", popup.mode.verb()),
+                    Style::default().fg(theme_text()),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "The app is waiting for the localhost callback on port 1455.",
+                    Style::default().fg(theme_muted()),
+                ),
+            ]),
+            Line::default(),
+            Line::from(vec![Span::styled(
+                popup.url.as_str(),
+                Style::default()
+                    .fg(theme_cyan())
+                    .add_modifier(Modifier::UNDERLINED),
+            )]),
+            Line::default(),
+            Line::from(vec![Span::styled(
+                "Esc or Enter hides this popup while login keeps running.",
+                Style::default().fg(theme_muted()),
+            )]),
+        ];
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
     fn toggle_exhausted(&mut self) {
         let items = self.list_items();
         let exhausted_count = self.exhausted_indices().len();
@@ -842,30 +972,38 @@ impl App {
         if self.add_in_progress {
             return;
         }
-        self.add_in_progress = true;
-        self.status = "opening browser for login...".to_string();
-        thread::spawn(move || {
-            let result = oauth::login_account().map_err(|error| error.to_string());
-            let _ = tx.send(WorkerEvent::AuthFinished {
-                result,
-                mode: AuthFlowMode::Add,
-            });
-        });
+        if let Err(error) = self.start_auth_flow(AuthFlowMode::Add, tx) {
+            self.status = error.to_string();
+        }
     }
 
     fn relogin_selected(&mut self, tx: Sender<WorkerEvent>) {
         if self.add_in_progress || self.selected_account_index().is_none() {
             return;
         }
+        if let Err(error) = self.start_auth_flow(AuthFlowMode::Relogin, tx) {
+            self.status = error.to_string();
+        }
+    }
+
+    fn start_auth_flow(&mut self, mode: AuthFlowMode, tx: Sender<WorkerEvent>) -> Result<()> {
+        if self.add_in_progress {
+            return Ok(());
+        }
+
+        let session = oauth::begin_login_session()?;
         self.add_in_progress = true;
-        self.status = "opening browser to re-login account...".to_string();
-        thread::spawn(move || {
-            let result = oauth::login_account().map_err(|error| error.to_string());
-            let _ = tx.send(WorkerEvent::AuthFinished {
-                result,
-                mode: AuthFlowMode::Relogin,
-            });
+        self.status = format!("open the {} link and complete login...", mode.verb());
+        self.auth_popup = Some(AuthLinkPopup {
+            mode: mode.clone(),
+            url: session.auth_url().to_string(),
         });
+
+        thread::spawn(move || {
+            let result = session.run().map_err(|error| error.to_string());
+            let _ = tx.send(WorkerEvent::AuthFinished { result, mode });
+        });
+        Ok(())
     }
 
     fn delete_selected(&mut self, tx: Sender<WorkerEvent>) -> Result<()> {

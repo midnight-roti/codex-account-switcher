@@ -21,6 +21,12 @@ const OAUTH_SCOPE: &str = "openid profile email offline_access";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const CALLBACK_ADDRESS: &str = "127.0.0.1:1455";
 
+pub struct LoginSession {
+    verifier: String,
+    state: String,
+    auth_url: String,
+}
+
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -37,58 +43,79 @@ struct MeResponse {
     name: String,
 }
 
-pub fn login_account() -> Result<AccountRecord> {
+pub fn begin_login_session() -> Result<LoginSession> {
     let verifier = random_string(64);
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
     let state = random_string(32);
+    let auth_url = build_authorize_url(&state, &challenge)?.to_string();
+    Ok(LoginSession {
+        verifier,
+        state,
+        auth_url,
+    })
+}
 
-    let auth_url = build_authorize_url(&state, &challenge)?;
-    webbrowser::open(auth_url.as_str()).context("failed to open browser")?;
-
-    let code = wait_for_callback(&state)?;
-    let token = exchange_code(&code, &verifier)?;
-
-    let claims = storage::parse_access_token(&token.access_token);
-    let me = fetch_me(&token.access_token).unwrap_or_default();
-
-    let account_id = storage::canonical_account_id(&[claims.account_id.as_str()]);
-    if account_id.trim().is_empty() {
-        bail!("failed to extract account_id from token");
+impl LoginSession {
+    pub fn auth_url(&self) -> &str {
+        &self.auth_url
     }
 
-    Ok(AccountRecord {
-        label: if !me.email.trim().is_empty() {
-            me.email.trim().to_string()
-        } else if !me.name.trim().is_empty() {
-            me.name.trim().to_string()
-        } else if !claims.email.trim().is_empty() {
-            claims.email.clone()
-        } else {
-            account_id.clone()
-        },
-        email: if !me.email.trim().is_empty() {
-            me.email.trim().to_string()
-        } else {
-            claims.email
-        },
-        account_id,
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        expires_at: if token.expires_in > 0 {
-            Some(chrono::Utc::now() + chrono::Duration::seconds(token.expires_in))
-        } else {
-            claims.expires_at
-        },
-        client_id: if !claims.client_id.trim().is_empty() {
-            claims.client_id
-        } else {
-            OAUTH_CLIENT_ID.to_string()
-        },
-        managed: true,
-        codex_active: false,
-        quota: crate::model::QuotaState::Idle,
-    })
+    pub fn open_browser(&self) -> Result<()> {
+        webbrowser::open(self.auth_url.as_str()).context("failed to open browser")?;
+        Ok(())
+    }
+
+    pub fn run(self) -> Result<AccountRecord> {
+        self.open_browser()?;
+        self.finish()
+    }
+
+    pub fn finish(self) -> Result<AccountRecord> {
+        let code = wait_for_callback(&self.state)?;
+        let token = exchange_code(&code, &self.verifier)?;
+
+        let claims = storage::parse_access_token(&token.access_token);
+        let me = fetch_me(&token.access_token).unwrap_or_default();
+
+        let account_id = storage::canonical_account_id(&[claims.account_id.as_str()]);
+        if account_id.trim().is_empty() {
+            bail!("failed to extract account_id from token");
+        }
+
+        Ok(AccountRecord {
+            label: if !me.email.trim().is_empty() {
+                me.email.trim().to_string()
+            } else if !me.name.trim().is_empty() {
+                me.name.trim().to_string()
+            } else if !claims.email.trim().is_empty() {
+                claims.email.clone()
+            } else {
+                account_id.clone()
+            },
+            email: if !me.email.trim().is_empty() {
+                me.email.trim().to_string()
+            } else {
+                claims.email
+            },
+            account_id,
+            access_token: token.access_token,
+            refresh_token: token.refresh_token,
+            expires_at: if token.expires_in > 0 {
+                Some(chrono::Utc::now() + chrono::Duration::seconds(token.expires_in))
+            } else {
+                claims.expires_at
+            },
+            client_id: if !claims.client_id.trim().is_empty() {
+                claims.client_id
+            } else {
+                OAUTH_CLIENT_ID.to_string()
+            },
+            managed: true,
+            codex_active: false,
+            quota: crate::model::QuotaState::Idle,
+        })
+    }
 }
 
 fn build_authorize_url(state: &str, challenge: &str) -> Result<Url> {

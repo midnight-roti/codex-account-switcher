@@ -6,6 +6,10 @@ description = "Terminal account switcher for Codex with quota visibility"
 license = "MIT"
 repository = "https://github.com/midnight-roti/codex-account-switcher"
 
+[[bin]]
+name = "cas"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
