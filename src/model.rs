@@ -1,5 +1,11 @@
 use chrono::{DateTime, Utc};
 
+pub const FIVE_HOUR_WINDOW_SECONDS: i64 = 18_000;
+pub const WEEK_WINDOW_SECONDS: i64 = 604_800;
+
+const MIN_MONTH_WINDOW_SECONDS: i64 = 28 * 24 * 60 * 60;
+const MAX_MONTH_WINDOW_SECONDS: i64 = 31 * 24 * 60 * 60;
+
 #[derive(Clone, Debug, Default)]
 pub struct AccountRecord {
     pub label: String,
@@ -47,10 +53,10 @@ impl AccountRecord {
     pub fn is_exhausted(&self) -> bool {
         match &self.quota {
             QuotaState::Ready(data) => {
-                let hourly = data.window_by_seconds(18_000);
-                let weekly = data.window_by_seconds(604_800);
-                hourly.map(|w| w.left_percent <= 0.0).unwrap_or(false)
-                    || weekly.map(|w| w.left_percent <= 0.0).unwrap_or(false)
+                let five_hour = data.window_by_seconds(FIVE_HOUR_WINDOW_SECONDS);
+                let long_period = data.long_window();
+                five_hour.map(|w| w.left_percent <= 0.0).unwrap_or(false)
+                    || long_period.map(|w| w.left_percent <= 0.0).unwrap_or(false)
             }
             _ => false,
         }
@@ -59,19 +65,19 @@ impl AccountRecord {
     pub fn sort_tuple(&self) -> (i32, i32, i64, String) {
         match &self.quota {
             QuotaState::Ready(data) => {
-                let hourly = data
-                    .window_by_seconds(18_000)
+                let five_hour = data
+                    .window_by_seconds(FIVE_HOUR_WINDOW_SECONDS)
                     .map(|w| (w.left_percent * 100.0) as i64)
                     .unwrap_or(-1);
-                let weekly = data
-                    .window_by_seconds(604_800)
+                let long_period = data
+                    .long_window()
                     .map(|w| (w.left_percent * 100.0) as i64)
                     .unwrap_or(-1);
                 let exhausted_rank = if self.is_exhausted() { 1 } else { 0 };
                 (
                     exhausted_rank,
                     0,
-                    -(hourly + weekly),
+                    -(five_hour + long_period),
                     self.display_name().to_lowercase(),
                 )
             }
@@ -119,6 +125,19 @@ impl UsageData {
             .iter()
             .find(|window| window.window_sec == window_sec)
     }
+
+    pub fn long_window(&self) -> Option<&QuotaWindow> {
+        self.windows
+            .iter()
+            .filter(|window| window.window_sec != FIVE_HOUR_WINDOW_SECONDS)
+            .max_by_key(|window| window.window_sec)
+    }
+
+    pub fn long_window_label(&self) -> &'static str {
+        self.long_window()
+            .map(QuotaWindow::label)
+            .unwrap_or("Period")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -127,4 +146,74 @@ pub struct QuotaWindow {
     pub used_percent: f64,
     pub left_percent: f64,
     pub reset_at: Option<DateTime<Utc>>,
+}
+
+impl QuotaWindow {
+    pub fn label(&self) -> &'static str {
+        match self.window_sec {
+            FIVE_HOUR_WINDOW_SECONDS => "5h",
+            WEEK_WINDOW_SECONDS => "Week",
+            MIN_MONTH_WINDOW_SECONDS..=MAX_MONTH_WINDOW_SECONDS => "Month",
+            _ => "Period",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MONTH_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+    fn usage(windows: &[(i64, f64)]) -> UsageData {
+        UsageData {
+            windows: windows
+                .iter()
+                .map(|(window_sec, left_percent)| QuotaWindow {
+                    window_sec: *window_sec,
+                    used_percent: 100.0 - left_percent,
+                    left_percent: *left_percent,
+                    reset_at: None,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn long_window_uses_weekly_window_for_paid_plans() {
+        let data = usage(&[
+            (FIVE_HOUR_WINDOW_SECONDS, 40.0),
+            (WEEK_WINDOW_SECONDS, 70.0),
+        ]);
+
+        let window = data.long_window().expect("weekly window");
+        assert_eq!(window.window_sec, WEEK_WINDOW_SECONDS);
+        assert_eq!(data.long_window_label(), "Week");
+    }
+
+    #[test]
+    fn long_window_uses_monthly_window_when_weekly_is_absent() {
+        let data = usage(&[
+            (FIVE_HOUR_WINDOW_SECONDS, 40.0),
+            (MONTH_WINDOW_SECONDS, 70.0),
+        ]);
+
+        let window = data.long_window().expect("monthly window");
+        assert_eq!(window.window_sec, MONTH_WINDOW_SECONDS);
+        assert_eq!(data.long_window_label(), "Month");
+    }
+
+    #[test]
+    fn exhaustion_uses_monthly_window_for_free_plans() {
+        let account = AccountRecord {
+            quota: QuotaState::Ready(usage(&[
+                (FIVE_HOUR_WINDOW_SECONDS, 40.0),
+                (MONTH_WINDOW_SECONDS, 0.0),
+            ])),
+            ..Default::default()
+        };
+
+        assert!(account.is_exhausted());
+    }
 }
