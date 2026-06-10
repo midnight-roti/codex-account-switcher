@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use ratatui::Terminal;
 
 use crate::api;
-use crate::model::{AccountRecord, QuotaState};
+use crate::model::{AccountRecord, QuotaState, QuotaWindow, FIVE_HOUR_WINDOW_SECONDS};
 use crate::oauth;
 use crate::storage;
 
@@ -182,7 +182,10 @@ enum ListItem {
 #[derive(Debug)]
 enum WorkerEvent {
     QuotaLoaded(AccountRecord),
-    QuotaFailed { key: String, error: String },
+    QuotaFailed {
+        key: String,
+        error: String,
+    },
     AuthFinished {
         result: Result<AccountRecord, String>,
         mode: AuthFlowMode,
@@ -552,7 +555,7 @@ impl App {
                 Cell::from("Active"),
                 Cell::from("Account"),
                 Cell::from("5h"),
-                Cell::from("Week"),
+                Cell::from("Period"),
             ])
             .style(
                 Style::default()
@@ -680,8 +683,8 @@ impl App {
                 let account = &self.accounts[*index];
                 let marker = if selected { "▶" } else { " " };
                 let account_cell = account_cell(account);
-                let five_hour = quota_cell(&account.quota, 18_000);
-                let weekly = quota_cell(&account.quota, 604_800);
+                let five_hour = quota_cell(&account.quota, FIVE_HOUR_WINDOW_SECONDS);
+                let long_period = long_quota_cell(&account.quota);
                 let active = active_badges(account);
 
                 let row = Row::new(vec![
@@ -689,7 +692,7 @@ impl App {
                     Cell::from(active),
                     Cell::from(account_cell),
                     Cell::from(five_hour),
-                    Cell::from(weekly),
+                    Cell::from(long_period),
                 ]);
                 if selected {
                     row.style(selected_style)
@@ -769,14 +772,14 @@ impl App {
                 label_span("5h Reset"),
                 Span::raw(": "),
                 Span::styled(
-                    quota_reset_text(&account.quota, 18_000),
+                    quota_reset_text(&account.quota, FIVE_HOUR_WINDOW_SECONDS),
                     Style::default().fg(theme_text()),
                 ),
                 Span::raw("  "),
-                label_span("Week Reset"),
+                label_span(long_quota_reset_label(&account.quota)),
                 Span::raw(": "),
                 Span::styled(
-                    quota_reset_text(&account.quota, 604_800),
+                    long_quota_reset_text(&account.quota),
                     Style::default().fg(theme_text()),
                 ),
             ]),
@@ -900,18 +903,14 @@ impl App {
         frame.render_widget(block, area);
 
         let lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("Open this {} URL in any browser.", popup.mode.verb()),
-                    Style::default().fg(theme_text()),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "The app is waiting for the localhost callback on port 1455.",
-                    Style::default().fg(theme_muted()),
-                ),
-            ]),
+            Line::from(vec![Span::styled(
+                format!("Open this {} URL in any browser.", popup.mode.verb()),
+                Style::default().fg(theme_text()),
+            )]),
+            Line::from(vec![Span::styled(
+                "The app is waiting for the localhost callback on port 1455.",
+                Style::default().fg(theme_muted()),
+            )]),
             Line::default(),
             Line::from(vec![Span::styled(
                 popup.url.as_str(),
@@ -1289,28 +1288,50 @@ fn quota_cell(state: &QuotaState, window_sec: i64) -> Text<'static> {
             truncate(error, 20),
             Style::default().fg(theme_danger()),
         ))),
-        QuotaState::Ready(data) => match data.window_by_seconds(window_sec) {
-            Some(window) => {
-                let bar_style = quota_style(window.left_percent);
-                Text::from(Line::from(vec![
-                    Span::styled(mini_bar(window.left_percent), bar_style),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:>3.0}%", window.left_percent),
-                        bar_style.add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format_reset(window.reset_at),
-                        Style::default().fg(theme_muted()),
-                    ),
-                ]))
-            }
-            None => Text::from(Line::from(Span::styled(
-                "n/a",
-                Style::default().fg(theme_muted()),
-            ))),
-        },
+        QuotaState::Ready(data) => quota_window_text(data.window_by_seconds(window_sec)),
+    }
+}
+
+fn long_quota_cell(state: &QuotaState) -> Text<'static> {
+    match state {
+        QuotaState::Idle => Text::from(Line::from(Span::styled(
+            "queued",
+            Style::default().fg(theme_muted()),
+        ))),
+        QuotaState::Loading => Text::from(Line::from(Span::styled(
+            "loading",
+            Style::default().fg(theme_cyan()),
+        ))),
+        QuotaState::Error(error) => Text::from(Line::from(Span::styled(
+            truncate(error, 20),
+            Style::default().fg(theme_danger()),
+        ))),
+        QuotaState::Ready(data) => quota_window_text(data.long_window()),
+    }
+}
+
+fn quota_window_text(window: Option<&QuotaWindow>) -> Text<'static> {
+    match window {
+        Some(window) => {
+            let bar_style = quota_style(window.left_percent);
+            Text::from(Line::from(vec![
+                Span::styled(mini_bar(window.left_percent), bar_style),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:>3.0}%", window.left_percent),
+                    bar_style.add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format_reset(window.reset_at),
+                    Style::default().fg(theme_muted()),
+                ),
+            ]))
+        }
+        None => Text::from(Line::from(Span::styled(
+            "n/a",
+            Style::default().fg(theme_muted()),
+        ))),
     }
 }
 
@@ -1399,6 +1420,29 @@ fn quota_reset_text(state: &QuotaState, window_sec: i64) -> String {
     }
 }
 
+fn long_quota_reset_text(state: &QuotaState) -> String {
+    match state {
+        QuotaState::Ready(data) => data
+            .long_window()
+            .map(|window| format_reset(window.reset_at))
+            .unwrap_or_else(|| "-".to_string()),
+        QuotaState::Loading => "loading".to_string(),
+        QuotaState::Error(_) => "error".to_string(),
+        QuotaState::Idle => "queued".to_string(),
+    }
+}
+
+fn long_quota_reset_label(state: &QuotaState) -> &'static str {
+    match state {
+        QuotaState::Ready(data) => match data.long_window_label() {
+            "Week" => "Week Reset",
+            "Month" => "Month Reset",
+            _ => "Period Reset",
+        },
+        _ => "Period Reset",
+    }
+}
+
 fn format_expiry(expiry: Option<chrono::DateTime<chrono::Utc>>) -> String {
     match expiry {
         Some(expiry) => expiry
@@ -1444,5 +1488,3 @@ fn plan_badge_span(plan: &str) -> Span<'static> {
         Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
     )
 }
-
-
