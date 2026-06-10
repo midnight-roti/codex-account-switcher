@@ -44,7 +44,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     sessions.truncate(options.limit);
 
-    print_usage_table(&sessions);
+    print_usage_table(&sessions, options.show_chart);
     Ok(())
 }
 
@@ -52,6 +52,7 @@ pub fn run(args: &[String]) -> Result<()> {
 struct UsageOptions {
     limit: usize,
     all: bool,
+    show_chart: bool,
     sessions_dir: Option<PathBuf>,
 }
 
@@ -60,6 +61,7 @@ impl UsageOptions {
         let mut options = Self {
             limit: 20,
             all: false,
+            show_chart: true,
             sessions_dir: None,
         };
 
@@ -67,6 +69,8 @@ impl UsageOptions {
         while index < args.len() {
             match args[index].as_str() {
                 "--all" => options.all = true,
+                "--chart" => options.show_chart = true,
+                "--no-chart" => options.show_chart = false,
                 "--limit" | "-n" => {
                     index += 1;
                     let Some(value) = args.get(index) else {
@@ -216,7 +220,7 @@ fn token_count_total(value: &Value) -> Option<TokenUsage> {
     })
 }
 
-fn print_usage_table(sessions: &[SessionUsage]) {
+fn print_usage_table(sessions: &[SessionUsage], show_chart: bool) {
     println!(
         "{:<16} {:<10} {:>12} {:>12} {:>12} {:>12} {:>12}  Session",
         "Started", "Model", "Input", "Cached", "Output", "Reasoning", "Total"
@@ -261,10 +265,121 @@ fn print_usage_table(sessions: &[SessionUsage]) {
             );
         }
     }
+
+    if show_chart {
+        print_usage_chart(sessions);
+    }
+}
+
+fn print_usage_chart(sessions: &[SessionUsage]) {
+    let max_total = sessions
+        .iter()
+        .filter_map(|session| session.total.as_ref().map(|usage| usage.total_tokens))
+        .max()
+        .unwrap_or(0);
+    if max_total == 0 {
+        return;
+    }
+
+    println!();
+    println!("Token composition");
+    println!("C=cached input  I=uncached input  O=output  R=reasoning");
+
+    for session in sessions {
+        let Some(total) = &session.total else {
+            continue;
+        };
+        let started = session
+            .started_at
+            .map(format_datetime)
+            .unwrap_or_else(|| "-".to_string());
+        let bar = usage_chart_bar(total, max_total, 48);
+        println!(
+            "{:<16} [{}] {}",
+            started,
+            bar,
+            format_count(total.total_tokens)
+        );
+    }
+}
+
+fn usage_chart_bar(usage: &TokenUsage, max_total: u64, width: usize) -> String {
+    if usage.total_tokens == 0 || max_total == 0 || width == 0 {
+        return String::new();
+    }
+
+    let cached_input = usage.cached_input_tokens.min(usage.input_tokens);
+    let uncached_input = usage.input_tokens.saturating_sub(cached_input);
+    let reasoning_output = usage.reasoning_output_tokens.min(usage.output_tokens);
+    let visible_output = usage.output_tokens.saturating_sub(reasoning_output);
+    let component_total = cached_input
+        .saturating_add(uncached_input)
+        .saturating_add(visible_output)
+        .saturating_add(reasoning_output)
+        .max(usage.total_tokens);
+
+    let scaled_width = (((usage.total_tokens as f64 / max_total as f64) * width as f64).round()
+        as usize)
+        .clamp(1, width);
+    let values = [
+        cached_input,
+        uncached_input,
+        visible_output,
+        reasoning_output,
+    ];
+    let components = [
+        (cached_input, 'C'),
+        (uncached_input, 'I'),
+        (visible_output, 'O'),
+        (reasoning_output, 'R'),
+    ];
+    let lengths = proportional_lengths(&values, component_total, scaled_width);
+
+    let mut bar = String::new();
+    for ((_, marker), length) in components.iter().zip(lengths) {
+        for _ in 0..length {
+            bar.push(*marker);
+        }
+    }
+    bar
+}
+
+fn proportional_lengths(values: &[u64], total: u64, width: usize) -> Vec<usize> {
+    if total == 0 || width == 0 {
+        return vec![0; values.len()];
+    }
+
+    let nonzero_count = values.iter().filter(|value| **value > 0).count();
+    let reserve_nonzero = width >= nonzero_count;
+    let mut lengths = Vec::with_capacity(values.len());
+    let mut remainders = Vec::with_capacity(values.len());
+    let mut used = if reserve_nonzero { nonzero_count } else { 0 };
+    let remaining_width = width.saturating_sub(used);
+
+    for (index, value) in values.iter().enumerate() {
+        let base = usize::from(reserve_nonzero && *value > 0);
+        let raw = *value as f64 * remaining_width as f64 / total as f64;
+        let length = raw.floor() as usize;
+        used += length;
+        lengths.push(base + length);
+        remainders.push((index, raw - length as f64));
+    }
+
+    remainders.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (index, _) in remainders.into_iter().take(width.saturating_sub(used)) {
+        lengths[index] += 1;
+    }
+
+    lengths
 }
 
 fn print_usage_help() {
-    println!("Usage: cas usage [--limit N] [--all] [--sessions-dir PATH]");
+    println!("Usage: cas usage [--limit N] [--all] [--chart|--no-chart] [--sessions-dir PATH]");
     println!();
     println!("Reads local Codex JSONL session logs and prints the latest cumulative token count per chat.");
 }
@@ -373,5 +488,31 @@ mod tests {
     #[test]
     fn formats_counts_with_grouping() {
         assert_eq!(format_count(6_600_483), "6,600,483");
+    }
+
+    #[test]
+    fn chart_bar_splits_cached_uncached_output_and_reasoning() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            output_tokens: 60,
+            reasoning_output_tokens: 10,
+            total_tokens: 160,
+        };
+
+        assert_eq!(usage_chart_bar(&usage, 160, 16), "CCCCIIIIIOOOOORR");
+    }
+
+    #[test]
+    fn chart_bar_scales_against_largest_session() {
+        let usage = TokenUsage {
+            input_tokens: 50,
+            cached_input_tokens: 0,
+            output_tokens: 50,
+            reasoning_output_tokens: 0,
+            total_tokens: 100,
+        };
+
+        assert_eq!(usage_chart_bar(&usage, 200, 20).len(), 10);
     }
 }

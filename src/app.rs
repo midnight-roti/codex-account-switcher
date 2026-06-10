@@ -484,6 +484,15 @@ impl App {
             Line::from(vec![
                 Span::styled(self.status.as_str(), Style::default().fg(theme_muted())),
                 Span::raw("  "),
+                Span::styled("Accounts", Style::default().fg(theme_muted())),
+                Span::raw(": "),
+                Span::styled(
+                    self.accounts.len().to_string(),
+                    Style::default()
+                        .fg(theme_pink())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
                 Span::styled(
                     if self.add_in_progress {
                         "login in progress..."
